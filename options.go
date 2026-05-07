@@ -21,6 +21,7 @@ type ClientOptions struct {
 	ReconnectDelay    time.Duration // initial delay; doubles up to MaxReconnectDelay
 	MaxReconnectDelay time.Duration
 	TLSConfig         *tls.Config // nil -> plain TCP
+	MaxInflight       int         // max concurrent unacked QoS>=1 publishes; 0 -> default
 
 	// OnConnectionLost is invoked when the read loop terminates with an error.
 	// If AutoReconnect is true, the client will attempt to reconnect after.
@@ -37,6 +38,7 @@ func NewClientOptions() *ClientOptions {
 		WriteTimeout:      10 * time.Second,
 		ReconnectDelay:    1 * time.Second,
 		MaxReconnectDelay: 30 * time.Second,
+		MaxInflight:       1024,
 	}
 }
 
@@ -52,6 +54,18 @@ func (o *ClientOptions) SetConnectTimeout(d time.Duration) *ClientOptions {
 }
 func (o *ClientOptions) SetAutoReconnect(v bool) *ClientOptions    { o.AutoReconnect = v; return o }
 func (o *ClientOptions) SetTLSConfig(c *tls.Config) *ClientOptions { o.TLSConfig = c; return o }
+
+// SetMaxInflight bounds the number of concurrently-unacknowledged QoS 1 / 2
+// publishes. When the cap is reached, additional Publish calls block until
+// an ack frees a slot (or ctx is canceled). QoS 0 is not counted because it
+// has no ack.
+func (o *ClientOptions) SetMaxInflight(n int) *ClientOptions {
+	if n < 1 {
+		n = 1
+	}
+	o.MaxInflight = n
+	return o
+}
 func (o *ClientOptions) SetOnConnectionLost(fn func(error)) *ClientOptions {
 	o.OnConnectionLost = fn
 	return o

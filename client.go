@@ -61,6 +61,11 @@ type Client struct {
 	subsMu   sync.RWMutex
 	handlers map[string]MessageHandler
 
+	// inflightSlots is a buffered channel acting as a semaphore. A QoS 1/2
+	// Publish acquires one slot before sending and releases it on ack /
+	// error / ctx cancel. Capacity == MaxInflight.
+	inflightSlots chan struct{}
+
 	stopPing chan struct{}
 	doneCh   chan struct{}
 
@@ -73,14 +78,19 @@ func NewClient(opts *ClientOptions) *Client {
 	if opts == nil {
 		opts = NewClientOptions()
 	}
+	maxInflight := opts.MaxInflight
+	if maxInflight < 1 {
+		maxInflight = 1024
+	}
 	return &Client{
-		opts:     opts,
-		nextPID:  1,
-		pubAcks:  make(map[uint16]chan byte),
-		pubRecs:  make(map[uint16]chan byte),
-		pubComps: make(map[uint16]chan byte),
-		subAcks:  make(map[uint16]chan []byte),
-		handlers: make(map[string]MessageHandler),
+		opts:          opts,
+		nextPID:       1,
+		pubAcks:       make(map[uint16]chan byte),
+		pubRecs:       make(map[uint16]chan byte),
+		pubComps:      make(map[uint16]chan byte),
+		subAcks:       make(map[uint16]chan []byte),
+		handlers:      make(map[string]MessageHandler),
+		inflightSlots: make(chan struct{}, maxInflight),
 	}
 }
 
@@ -114,6 +124,13 @@ func (c *Client) dialAndHandshake(ctx context.Context) error {
 	rawConn, err := d.DialContext(dialCtx, "tcp", c.opts.BrokerAddr)
 	if err != nil {
 		return fmt.Errorf("artmq: dial: %w", err)
+	}
+
+	// Disable Nagle on the raw socket before any TLS layering. MQTT control
+	// packets are small and ack-driven; Nagle adds up to ~40ms of kernel
+	// coalescing on PUBACK/PUBREC for no benefit.
+	if tc, ok := rawConn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
 	}
 
 	var conn net.Conn = rawConn
@@ -250,23 +267,30 @@ func (c *Client) shutdown(cause error) {
 	}
 }
 
+// writeRaw serializes one MQTT control packet and pushes it through the
+// per-conn bufio.Writer. Flush is unconditional: the caller almost always
+// blocks waiting for an ack from this exact packet (Publish→PUBACK,
+// Subscribe→SUBACK, etc.), so deferring the flush would deadlock. Concurrent
+// publishes that contend on writeMu still get coalesced inside bufio's
+// buffer naturally.
 func (c *Client) writeRaw(data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	c.mu.Lock()
 	conn := c.conn
+	w := c.writer
 	c.mu.Unlock()
-	if conn == nil {
+	if conn == nil || w == nil {
 		return ErrNotConnected
 	}
 	if c.opts.WriteTimeout > 0 {
 		_ = conn.SetWriteDeadline(time.Now().Add(c.opts.WriteTimeout))
 		defer conn.SetWriteDeadline(time.Time{})
 	}
-	if _, err := conn.Write(data); err != nil {
+	if _, err := w.Write(data); err != nil {
 		return err
 	}
-	return nil
+	return w.Flush()
 }
 
 // allocatePacketID reserves the next available 1..65535 packet id.
@@ -294,10 +318,19 @@ func (c *Client) allocatePacketID() (uint16, error) {
 }
 
 // Publish sends a message to topic. For QoS 1/2, Publish blocks until the
-// broker acknowledges (PUBACK / PUBCOMP) or ctx is canceled.
+// broker acknowledges (PUBACK / PUBCOMP) or ctx is canceled. QoS 1/2 also
+// participate in MaxInflight backpressure: when the cap is reached, Publish
+// blocks until an ack frees a slot.
 func (c *Client) Publish(ctx context.Context, topic string, payload []byte, opts ...PublishOption) error {
 	if !c.connected.Load() {
 		return ErrNotConnected
+	}
+
+	// Fast path: QoS 0. No packet id, no inflight slot, no ack channel.
+	// Inspect QoS without building a publishPacket if no options were given.
+	if len(opts) == 0 {
+		pkt := publishPacket{Topic: topic, Payload: payload}
+		return c.writeRaw(pkt.encode())
 	}
 	pkt := &publishPacket{Topic: topic, Payload: payload}
 	for _, o := range opts {
@@ -308,6 +341,11 @@ func (c *Client) Publish(ctx context.Context, topic string, payload []byte, opts
 	case 0:
 		return c.writeRaw(pkt.encode())
 	case 1:
+		if err := c.acquireInflight(ctx); err != nil {
+			return err
+		}
+		defer c.releaseInflight()
+
 		id, err := c.allocatePacketID()
 		if err != nil {
 			return err
@@ -340,6 +378,11 @@ func (c *Client) Publish(ctx context.Context, topic string, payload []byte, opts
 			return ctx.Err()
 		}
 	case 2:
+		if err := c.acquireInflight(ctx); err != nil {
+			return err
+		}
+		defer c.releaseInflight()
+
 		id, err := c.allocatePacketID()
 		if err != nil {
 			return err
@@ -375,7 +418,6 @@ func (c *Client) Publish(ctx context.Context, topic string, payload []byte, opts
 			cleanup()
 			return ctx.Err()
 		}
-		// Send PUBREL, wait for PUBCOMP.
 		if err := c.writeRaw(encodeAck(pktPUBREL, id)); err != nil {
 			cleanup()
 			return err
@@ -396,6 +438,33 @@ func (c *Client) Publish(ctx context.Context, topic string, payload []byte, opts
 		}
 	default:
 		return fmt.Errorf("artmq: invalid QoS %d", pkt.QoS)
+	}
+}
+
+// acquireInflight blocks until either a slot frees up, ctx is canceled, or
+// the connection is torn down. Only called for QoS 1/2.
+func (c *Client) acquireInflight(ctx context.Context) error {
+	select {
+	case c.inflightSlots <- struct{}{}:
+		return nil
+	default:
+	}
+	// Slow path: cap reached. Wait, but stay responsive to ctx and shutdown.
+	select {
+	case c.inflightSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.doneCh:
+		return ErrNotConnected
+	}
+}
+
+func (c *Client) releaseInflight() {
+	select {
+	case <-c.inflightSlots:
+	default:
+		// No slot held — defensive against double-release.
 	}
 }
 

@@ -64,6 +64,7 @@ c.Publish(ctx, "events/hello", []byte("hi"),
 | `ConnectTimeout` | 10s | for the TCP+CONNACK round-trip |
 | `WriteTimeout` | 10s | per outbound packet |
 | `TLSConfig` | nil | non-nil enables TLS |
+| `MaxInflight` | 1024 | cap on concurrent unacked QoS 1/2 publishes; further Publish calls block until a slot frees |
 
 ## Publish options
 
@@ -86,6 +87,7 @@ All examples assume the artmq broker is listening on `localhost:1883`.
 | [`examples/wildcards`](./examples/wildcards) | `+` (single-level) and `#` (multi-level) topic filters; how the topic matcher routes to multiple handlers |
 | [`examples/priority`](./examples/priority) | artmq priority queue via `WithPriority` (lower value served first) plus `WithTTL` |
 | [`examples/shared-subs`](./examples/shared-subs) | MQTT 5 `$share/<group>/<filter>` for load-balanced worker pools |
+| [`examples/bench`](./examples/bench) | local sanity-check publisher harness; flags for QoS / concurrency / payload size; reports msg/s and p50/p95/p99 latency |
 
 ```bash
 go run ./examples/pubsub
